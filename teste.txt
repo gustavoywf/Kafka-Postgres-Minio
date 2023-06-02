@@ -1,0 +1,549 @@
+import numpy as np
+import pandas as pd
+from ehOChurn import io, utils
+from gamma.config import get_config
+from dateutil.relativedelta import relativedelta
+
+
+def p90(x):
+    return x.quantile(0.9)
+
+
+def p10(x):
+    return x.quantile(0.1)
+
+
+def load_master_data(p_top_risk=0.4):
+    """
+    Load master table for top p_top_risk most risky clients according to churn prediction
+    (default to 40% most risky percentile)
+    """
+    config = get_config()
+    master_table = io.load_table("domain", "master_table")
+    # Lags de take_rate precisam ser até 6 meses
+    master_table = master_table.drop(
+        [
+            "take_rate_mdr_total_lag_1",
+            "take_rate_mdr_total_lag_2",
+            "take_rate_mdr_total_lag_3",
+        ],
+        axis=1,
+    )
+    master_table = utils.create_lag_features(
+        df=master_table,
+        group_cols=["nu_so_ec"],
+        target_col="take_rate_mdr_total",
+        num_lags=6,
+        sort_col="anomes",
+    )
+    anomes_scoring = config["classifier"]["anomes_score"]
+    scoring = io.load_table(
+        "prediction_outputs",
+        "prediction_output",
+        path_params={"anomes_prediction": anomes_scoring},
+    )
+    risk_thres = scoring.probabilidade_churn_calibrada.sort_values().quantile(
+        1 - p_top_risk
+    )
+    # Clients to select according to risk threshold
+    ecs_to_select = (
+        scoring.loc[
+            scoring["probabilidade_churn_calibrada"] >= risk_thres,
+            ["nu_so_ec", "probabilidade_churn_calibrada"],
+        ]
+        .drop_duplicates()
+        .rename(columns={"probabilidade_churn_calibrada": "risk_score"})
+    )
+    df_predict = master_table.query("anomes==@anomes_scoring").merge(
+        ecs_to_select, on=["nu_so_ec"]
+    )
+    # Column where we'll fill archetypes info as business rules are applied
+    df_predict["arquetipo"] = np.nan
+    return df_predict, master_table, anomes_scoring
+
+
+def compute_bercario(df_predict):
+    """
+    For bercario we'll consider clients with aging less/equal than 3 months
+    """
+    df_predict.loc[
+        df_predict.arquetipo.isnull() & (df_predict.aging_months <= 3), "arquetipo"
+    ] = "bercario"
+    return df_predict
+
+
+def compute_insatisfeito(df_predict):
+    """
+    For insatisfeito we'll consider clients that have recent complaints or low service notes.
+    On client cases that were classified as bercario but respect insatisfeito rule, we'll make them
+    insatisfeito once this is a bigger issue / more important trigger
+    """
+    # Deveria repescar o aging
+    df_predict.loc[
+        (df_predict["arquetipo"].isnull() | (df_predict.arquetipo == "bercario"))
+        & (
+            (df_predict["qtde_reclamacao"] > 0)
+            | (df_predict["qtde_reclamacao_lag_1"] > 0)
+            | (df_predict["qtde_reclamacao_lag_2"] > 0)
+            | (df_predict["median_nota_atend"] <= 5)
+            | (df_predict["median_nota_atend_lag_1"] <= 5)
+            | (df_predict["median_nota_atend_lag_2"] <= 5)
+            | (df_predict["median_nota_resolucao"] == 2)  # O problema não foi resolvido
+            | (
+                df_predict["median_nota_resolucao_lag_1"] == 2
+            )  # O problema não foi resolvido
+            | (
+                df_predict["median_nota_resolucao_lag_2"] == 2
+            )  # O problema não foi resolvido
+            | (df_predict["median_nps_cielo"] <= 5)
+            | (df_predict["median_nps_cielo_lag_1"] <= 5)
+            | (df_predict["median_nps_cielo_lag_2"] <= 5)
+        ),
+        "arquetipo",
+    ] = "insatisfeito"
+    df_predict.loc[
+        (df_predict["qtde_reclamacao"] > 0)
+        | (df_predict["qtde_reclamacao_lag_1"] > 0)
+        | (df_predict["qtde_reclamacao_lag_2"] > 0),
+        "qtd_reclamacoes_l3m",
+    ] = (
+        df_predict[
+            ["qtde_reclamacao", "qtde_reclamacao_lag_1", "qtde_reclamacao_lag_2"]
+        ]
+        .fillna(0)
+        .sum(axis=1)
+    )
+    return df_predict
+
+
+def compute_massivado(df_predict):
+    """
+    For massivado we'll consider clients that positive take rate variation in last 3 months is bigger than
+    p90 of its respective GDC
+    """
+    # Create delta features for 6 months of take rate variation
+    df_predict = utils.create_growth_cols(
+        df=df_predict, col="take_rate_mdr_total", num_periods=6
+    )
+    for i in range(0, 5):
+        # Compute p90 delta take rate for GDC to have as reference of high positive variations
+        df_predict[
+            f"delta_take_rate_mdr_total_lag_{i}_vs_lag_{i+1}_gdc_p90"
+        ] = df_predict.groupby(["anomes", "dc_setr_bigdata", "sg_so_uf", "bin_porte"])[
+            f"delta_take_rate_mdr_total_lag_{i}_vs_lag_{i+1}"
+        ].transform(
+            p90
+        )
+    # If positive take rate variation in last 3 months is bigger than p90 of GDC, we'll
+    # consider the client massivado
+    df_predict.loc[
+        (
+            (
+                (df_predict["delta_take_rate_mdr_total_lag_0_vs_lag_1"] > 0)
+                & (
+                    df_predict["delta_take_rate_mdr_total_lag_0_vs_lag_1"]
+                    > df_predict["delta_take_rate_mdr_total_lag_0_vs_lag_1_gdc_p90"]
+                )
+            )
+            | (
+                (df_predict["delta_take_rate_mdr_total_lag_1_vs_lag_2"] > 0)
+                & (
+                    df_predict["delta_take_rate_mdr_total_lag_1_vs_lag_2"]
+                    > df_predict["delta_take_rate_mdr_total_lag_1_vs_lag_2_gdc_p90"]
+                )
+            )
+        )
+        & df_predict.arquetipo.isnull(),
+        "arquetipo",
+    ] = "massivado"
+    return df_predict
+
+
+def compute_sitiado(df_predict):
+    """
+    Sitiado are those clients that have experienced churn rythm increase on their respective GDCs.
+    Once the churn increase value is sensible to GDC sizes, we compute this archetype in two steps:
+    for small GDC (<p40 of sizes) and big GDCs (>p60 of sizes)
+    """
+    # We will consider only GDC bigger than 5 clients so we don't have very specific cases
+    n_min_gdc = 5
+    # Percetile to define big and small GDCs
+    percentile_size_gdc = 0.4  # (median brings a lot noise here)
+    # Inside GDCs, we'll consider churn increases bigger than median
+    percentile_ritmo_churn_aumento_gdc = 0.5  # maior que a mediana
+    # For small GDCs, our scope will be those smaller than 40 percentile of sizes
+    # For big GDCs, our scope will be GDCs bigger than 60 percentile of sizes
+    # # Lag 1
+    max_gdc_pequeno_lag_1 = df_predict.loc[
+        df_predict["total_ecs_in_bin_aging_bin_porte_dc_setr_bigdata_sg_so_uf_lag_1"]
+        > n_min_gdc,
+        "total_ecs_in_bin_aging_bin_porte_dc_setr_bigdata_sg_so_uf_lag_1",
+    ].quantile(percentile_size_gdc)
+    min_gdc_grande_lag_1 = df_predict.loc[
+        df_predict["total_ecs_in_bin_aging_bin_porte_dc_setr_bigdata_sg_so_uf_lag_1"]
+        > n_min_gdc,
+        "total_ecs_in_bin_aging_bin_porte_dc_setr_bigdata_sg_so_uf_lag_1",
+    ].quantile(1 - percentile_size_gdc)
+    # # Lag 2
+    max_gdc_pequeno_lag_2 = df_predict.loc[
+        df_predict["total_ecs_in_bin_aging_bin_porte_dc_setr_bigdata_sg_so_uf_lag_2"]
+        > n_min_gdc,
+        "total_ecs_in_bin_aging_bin_porte_dc_setr_bigdata_sg_so_uf_lag_2",
+    ].quantile(percentile_size_gdc)
+
+    min_gdc_grande_lag_2 = df_predict.loc[
+        df_predict["total_ecs_in_bin_aging_bin_porte_dc_setr_bigdata_sg_so_uf_lag_2"]
+        > n_min_gdc,
+        "total_ecs_in_bin_aging_bin_porte_dc_setr_bigdata_sg_so_uf_lag_2",
+    ].quantile(1 - percentile_size_gdc)
+    # Dhurn rythm increase
+    df_predict["aumento_ritmo_churn_gdc"] = df_predict.eval(
+        "delta_total_churn_1_month_in_bin_aging_bin_porte_dc_setr_bigdata_sg_so_uf_lag_0_vs_lag_1"
+        "- delta_total_churn_1_month_in_bin_aging_bin_porte_dc_setr_bigdata_sg_so_uf_lag_1_vs_lag_2"
+    )
+    # Check if there is churn rythm increase for small GDCs
+    pequenos_idx = (
+        (
+            df_predict[
+                "total_ecs_in_bin_aging_bin_porte_dc_setr_bigdata_sg_so_uf_lag_1"
+            ]
+            > n_min_gdc
+        )
+        & (
+            df_predict[
+                "total_ecs_in_bin_aging_bin_porte_dc_setr_bigdata_sg_so_uf_lag_1"
+            ]
+            <= max_gdc_pequeno_lag_1
+        )
+        & (
+            df_predict[
+                "total_ecs_in_bin_aging_bin_porte_dc_setr_bigdata_sg_so_uf_lag_2"
+            ]
+            > n_min_gdc
+        )
+        & (
+            df_predict[
+                "total_ecs_in_bin_aging_bin_porte_dc_setr_bigdata_sg_so_uf_lag_2"
+            ]
+            <= max_gdc_pequeno_lag_2
+        )
+        & (df_predict["aumento_ritmo_churn_gdc"] > 0)
+    )
+    df_predict.loc[
+        pequenos_idx
+        & (
+            df_predict.aumento_ritmo_churn_gdc
+            > df_predict.aumento_ritmo_churn_gdc.quantile(
+                1 - percentile_ritmo_churn_aumento_gdc
+            )
+        )
+        & df_predict.arquetipo.isnull(),
+        "arquetipo",
+    ] = "sitiado"
+    # Check if there is churn rythm increase for small GDCs
+    grandes_idx = (
+        (
+            df_predict[
+                "total_ecs_in_bin_aging_bin_porte_dc_setr_bigdata_sg_so_uf_lag_1"
+            ]
+            >= min_gdc_grande_lag_1
+        )
+        & (
+            df_predict[
+                "total_ecs_in_bin_aging_bin_porte_dc_setr_bigdata_sg_so_uf_lag_2"
+            ]
+            <= min_gdc_grande_lag_2
+        )
+        & (df_predict["aumento_ritmo_churn_gdc"] > 0)
+    )
+    df_predict.loc[
+        grandes_idx
+        & (
+            df_predict.aumento_ritmo_churn_gdc
+            > df_predict.aumento_ritmo_churn_gdc.quantile(
+                1 - percentile_ritmo_churn_aumento_gdc
+            )
+        )
+        & df_predict.arquetipo.isnull(),
+        "arquetipo",
+    ] = "sitiado"
+    return df_predict
+
+
+def compute_infiel(df_predict, master_table, anomes_scoring):
+    """
+    Infiel is the client that have recent product or card brand mix concentration
+    (<p10 or p>90) compared to its GDC
+    """
+    prod_table = io.load_table("domain", "prod_info")
+    # Filter product tables only for L3M
+    prod_table = prod_table[prod_table["anomes"] == anomes_scoring].merge(
+        master_table[
+            [
+                "anomes",
+                "nu_so_ec",
+                "dc_setr_bigdata",
+                "sg_so_uf",
+                "bin_porte",
+                "status_dia",
+            ]
+        ],
+        on=["anomes", "nu_so_ec"],
+    )  # bring GDC infos
+    prod_mix_cols = ["mix_debito", "mix_cred"]
+    band_mix_cols = ["mix_master", "mix_visa"]
+    # For products/card brands concentration we'll use p10 and p90 compared to GDC
+    pmin = 0.1
+    pmax = 0.9
+    grp_cols = ["anomes", "dc_setr_bigdata", "sg_so_uf", "bin_porte"]
+    # If there is product concentration (client mix <p10 ou >p90 compared to GDC)
+    prod_table["conc_mix_prod"] = 0
+    for col in prod_mix_cols:
+        prod_table[f"{col}_gdc_pmin"] = prod_table.groupby(grp_cols)[col].transform(
+            "quantile", pmin
+        )
+        prod_table[f"{col}_gdc_pmax"] = prod_table.groupby(grp_cols)[col].transform(
+            "quantile", pmax
+        )
+
+        prod_table["conc_mix_prod"] = np.where(
+            (prod_table[col] < prod_table[f"{col}_gdc_pmin"])
+            | (prod_table[col] > prod_table[f"{col}_gdc_pmax"]),
+            1,
+            prod_table["conc_mix_prod"],
+        )
+    # If there is card brand concentration (client mix <p10 ou >p90 compared to GDC)
+    prod_table["conc_mix_band"] = 0
+    for col in band_mix_cols:
+        prod_table[f"{col}_gdc_pmin"] = prod_table.groupby(grp_cols)[col].transform(
+            "quantile", pmin
+        )
+        prod_table[f"{col}_gdc_pmax"] = prod_table.groupby(grp_cols)[col].transform(
+            "quantile", pmax
+        )
+
+        prod_table["conc_mix_band"] = np.where(
+            (prod_table[col] < prod_table[f"{col}_gdc_pmin"])
+            | (prod_table[col] > prod_table[f"{col}_gdc_pmax"]),
+            1,
+            prod_table["conc_mix_band"],
+        )
+    # If concentrates product or card brand mix -> infiel
+    prod_table["conc_mix"] = prod_table.eval("conc_mix_band + conc_mix_prod").clip(
+        upper=1
+    )
+    prod_table = prod_table.query("anomes==@anomes_scoring")[
+        ["nu_so_ec", "anomes", "conc_mix"]
+    ]
+    df_predict = df_predict.merge(prod_table, on=["nu_so_ec", "anomes"], how="left")
+    df_predict.loc[
+        df_predict["arquetipo"].isnull() & (df_predict["conc_mix"] == 1),
+        "arquetipo",
+    ] = "infiel"
+    return df_predict
+
+
+def compute_oportunista(df_predict, anomes_scoring):
+    """
+    Oportunista is the client that had relevant recent take rate decrease and recent
+    simulations
+    """
+    simulacoes_df = io.load_table("raw", "historico_simulacoes")
+    # Last 6 months of simulations
+    simulacoes_df = simulacoes_df[
+        (simulacoes_df["anomes"] <= anomes_scoring)
+        & (
+            (
+                simulacoes_df["anomes"]
+                >= int(
+                    (
+                        pd.to_datetime(anomes_scoring, format="%Y%m")
+                        - relativedelta(months=5)
+                    ).strftime("%Y%m")
+                )
+            )
+        )
+    ]
+    simulacoes_df = (
+        simulacoes_df.groupby(["nu_so_ec"], as_index=False)
+        .agg({"num_simulacoes": "sum"})
+        .rename(columns={"num_simulacoes": "num_simulacoes_l6m"})
+    )
+    df_predict = df_predict.merge(simulacoes_df, on=["nu_so_ec"], how="left")
+    df_predict.num_simulacoes_l6m = df_predict.num_simulacoes_l6m.fillna(0)
+    # Compute p10 delta take rate for GDC to have as reference of high negative variations
+    for i in range(0, 5):
+        df_predict[
+            f"delta_take_rate_mdr_total_lag_{i}_vs_lag_{i+1}_gdc_p10"
+        ] = df_predict.groupby(["anomes", "dc_setr_bigdata", "sg_so_uf", "bin_porte"])[
+            f"delta_take_rate_mdr_total_lag_{i}_vs_lag_{i+1}"
+        ].transform(
+            p10
+        )
+    # If negative take rate variation in last 3 months is lower than p10 of GDC, and simulations
+    # on last 6 months we'll consider the client oportunista
+    df_predict.loc[
+        # Lag 0 vs lag 1
+        (
+            (df_predict["delta_take_rate_mdr_total_lag_0_vs_lag_1"] < 0)
+            & (
+                df_predict["delta_take_rate_mdr_total_lag_0_vs_lag_1"]
+                < df_predict["delta_take_rate_mdr_total_lag_0_vs_lag_1_gdc_p10"]
+            )
+        )
+        | (  # Lag 1 vs lag 2
+            (df_predict["delta_take_rate_mdr_total_lag_1_vs_lag_2"] < 0)
+            & (
+                df_predict["delta_take_rate_mdr_total_lag_1_vs_lag_2"]
+                < df_predict["delta_take_rate_mdr_total_lag_1_vs_lag_2_gdc_p10"]
+            )
+        ),
+        "reducao_relevante_take_rate_l3m",
+    ] = 1
+    df_predict.loc[
+        (df_predict["arquetipo"].isnull())
+        & (df_predict["reducao_relevante_take_rate_l3m"] == 1)
+        & (df_predict["num_simulacoes_l6m"] > 0),
+        "arquetipo",
+    ] = "oportunista"
+    return df_predict
+
+
+def compute_vagalume(df_predict):
+    """
+    For vagalume we'll use the relationship level feature vagalume, which is computed
+    looking if the client has reactivate at least one time in the last 6 months. This is
+    only applied for clients with aging bigger than three months.
+    """
+    df_predict.loc[
+        (df_predict["vinculo"] == "vagalume") & (df_predict.aging_months > 3),
+        "is_vagalume",
+    ] = 1
+    df_predict["is_vagalume"] = df_predict["is_vagalume"].fillna(0)
+    df_predict.loc[
+        df_predict["arquetipo"].isnull() & (df_predict["is_vagalume"] == 1), "arquetipo"
+    ] = "vagalume"
+    return df_predict
+
+
+def compute_abandonado(df_predict):
+    """
+    Abandonado is the client that dind't have any recent visits (last 3 months)
+    """
+    df_predict["num_visitas_l3m"] = (
+        df_predict["num_visitas"].fillna(0)
+        + df_predict["num_visitas_lag_1"].fillna(0)
+        + df_predict["num_visitas_lag_2"].fillna(0)
+    )
+    df_predict.loc[
+        df_predict.arquetipo.isnull() & (df_predict["num_visitas_l3m"] == 0),
+        "arquetipo",
+    ] = "abandonado"
+    return df_predict
+
+
+def compute_incognito(df_predict):
+    """
+    Incognito is the default archetype and requires further investigation to understand its
+    behavior/triggers
+    """
+    df_predict.arquetipo = df_predict.arquetipo.fillna("incognito")
+    return df_predict
+
+
+def aggregate_in_chain(df_predict):
+    """
+    Choose archetypes for each chain based on revenue
+    """
+    arq_cadeia = df_predict.groupby(
+        ["cd_so_cadeia_forcada", "arquetipo"], as_index=False
+    ).agg({"fat_vl_capturado_total": "sum"})
+    arq_cadeia = arq_cadeia.sort_values(
+        "fat_vl_capturado_total", ascending=False
+    ).drop_duplicates("cd_so_cadeia_forcada")
+    return arq_cadeia
+
+
+def compute_archetypes():
+    df_predict, master_table, anomes_scoring = load_master_data()
+    df_predict = compute_bercario(df_predict)
+    df_predict = compute_insatisfeito(df_predict)
+    df_predict = compute_massivado(df_predict)
+    df_predict = compute_sitiado(df_predict)
+    df_predict = compute_infiel(df_predict, master_table, anomes_scoring)
+    df_predict = compute_oportunista(df_predict, anomes_scoring)
+    df_predict = compute_vagalume(df_predict)
+    df_predict = compute_abandonado(df_predict)
+    df_predict = compute_incognito(df_predict)
+    arq_cadeia = aggregate_in_chain(df_predict)
+    return arq_cadeia, df_predict, anomes_scoring
+
+
+def save_archetypes():
+    arq_cadeia, df_predict, anomes_scoring = compute_archetypes()
+    io.save_table(
+        df_predict,
+        "prediction_outputs",
+        "archetypes_features",
+        path_params={"anomes_prediction": anomes_scoring},
+    )
+    io.save_table(
+        arq_cadeia,
+        "prediction_outputs",
+        "archetypes",
+        path_params={"anomes_prediction": anomes_scoring},
+    )
+
+
+
+
+def create_lag_features(
+    df: pd.DataFrame,
+    group_cols: list,
+    target_col: str,
+    num_lags: int,
+    sort_col: Optional[str] = None,
+    start: Optional[int] = 1,
+    step: Optional[int] = 1,
+) -> pd.DataFrame:
+    """
+    Given a dataframe `df`, create a lag of n `num_lags` periods for the feature of the column `target_col`
+    grouping the data by `group_cols`. You can sort the df in the fuction, but since this will be reused for
+    a same `sort_col` multiple of times, it is useful to sort the `df` prior to the function call.
+
+    it starts from leg(i) = `start`, incrementing by `step` until the `num_lags` is reached
+    """
+
+    if sort_col is not None:
+        df = df.sort_values(by=sort_col)
+
+    for i in range(start, num_lags + 1, step):
+        column_name = f"{target_col}_lag_{i}"
+        df[column_name] = df.groupby(group_cols)[target_col].shift(i)
+
+    return df
+    
+    
+    
+    
+def create_growth_cols(df, col, num_periods):
+    for tup in zip(range(0, num_periods), range(1, num_periods + 1)):
+        if tup[0] == 0:
+            df[f"delta_{col}_lag_{tup[0]}_vs_lag_{tup[1]}"] = (
+                df[f"{col}"] - df[f"{col}_lag_{tup[1]}"]
+            )
+        else:
+            df[f"delta_{col}_lag_{tup[0]}_vs_lag_{tup[1]}"] = (
+                df[f"{col}_lag_{tup[0]}"] - df[f"{col}_lag_{tup[1]}"]
+            )
+
+        # if tup[0] == 0:
+        #     df[f"delta_pct_{col}_lag_{tup[0]}_vs_lag_{tup[1]}"] = (
+        #         df[f"{col}"] - df[f"{col}_lag_{tup[1]}"]
+        #     )/df[f"{col}_lag_{tup[1]}"]
+        # else:
+        #     df[f"delta_pct_{col}_lag_{tup[0]}_vs_lag_{tup[1]}"] = (
+        #         df[f"{col}_lag_{tup[0]}"] - df[f"{col}_lag_{tup[1]}"]
+        #     )/df[f"{col}_lag_{tup[1]}"]
+
+    return df
